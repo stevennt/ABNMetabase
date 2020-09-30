@@ -4070,7 +4070,7 @@ msgstr "Trợ giúp"
 
 #: frontend/src/metabase/nav/components/ProfileLink.jsx:72
 msgid "About Metabase"
-msgstr "Về Metabase"
+msgstr "Về ABN Data"
 
 #: frontend/src/metabase/nav/components/ProfileLink.jsx:78
 msgid "Sign out"

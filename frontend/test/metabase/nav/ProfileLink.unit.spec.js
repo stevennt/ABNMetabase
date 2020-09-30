@@ -18,7 +18,7 @@ describe("ProfileLink", () => {
           "Account settings",
           "Activity",
           "Help",
-          "About Metabase",
+          "ABN Data",
           "Sign out",
         ]);
       });
