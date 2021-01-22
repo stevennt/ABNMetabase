@@ -89,4 +89,11 @@ Note: two snippets cannot share the same name, as even if a snippet is archived,
 
 Any user who has SQL editor permissions to at least one of your connected databases will be able to view the snippets sidebar, and will be able to create, edit, and archive or unarchive any and all snippets — even snippets intended to be used with databases the user does NOT have SQL editing access to.
 
-[Metabase Enterprise Edition](https://www.metabase.com/enterprise/) contains additional functionality for organizing snippets into folders and setting permissions on those folders. See our [docs on SQL snippet folders and permissions](../enterprise-guide/sql-snippets.html) to learn more.
+[Metabase Enterprise Edition](https://www.metabase.com/enterprise/scale/index.html) contains additional functionality for organizing snippets into folders and setting permissions on those folders. See our [docs on SQL snippet folders and permissions](../enterprise-guide/sql-snippets.html).
+
+### Learn more
+
+Check out:
+
+- [SQL snippets](https://www.metabase.com/learn/building-analytics/sql-templates/sql-snippets.html)
+- [SQL Snippets vs Saved Questions vs Views](https://www.metabase.com/learn/building-analytics/sql-templates/organizing-sql.html).

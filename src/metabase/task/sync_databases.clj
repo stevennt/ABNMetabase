@@ -1,23 +1,21 @@
 (ns metabase.task.sync-databases
   "Scheduled tasks for syncing metadata/analyzing and caching FieldValues for connected Databases."
   (:require [clojure.tools.logging :as log]
-            [clojurewerkz.quartzite
-             [conversion :as qc]
-             [jobs :as jobs]
-             [triggers :as triggers]]
+            [clojurewerkz.quartzite.conversion :as qc]
+            [clojurewerkz.quartzite.jobs :as jobs]
             [clojurewerkz.quartzite.schedule.cron :as cron]
-            [metabase
-             [task :as task]
-             [util :as u]]
+            [clojurewerkz.quartzite.triggers :as triggers]
+            [java-time :as t]
             [metabase.models.database :as database :refer [Database]]
-            [metabase.sync
-             [analyze :as analyze]
-             [field-values :as field-values]
-             [sync-metadata :as sync-metadata]]
-            [metabase.util
-             [cron :as cron-util]
-             [i18n :refer [trs]]
-             [schema :as su]]
+            [metabase.sync.analyze :as analyze]
+            [metabase.sync.field-values :as field-values]
+            [metabase.sync.schedules :as sync.schedules]
+            [metabase.sync.sync-metadata :as sync-metadata]
+            [metabase.task :as task]
+            [metabase.util :as u]
+            [metabase.util.cron :as cron-util]
+            [metabase.util.i18n :refer [trs]]
+            [metabase.util.schema :as su]
             [schema.core :as s]
             [toucan.db :as db])
   (:import metabase.models.database.DatabaseInstance
@@ -37,7 +35,27 @@
 ;; The DisallowConcurrentExecution on the two defrecords below attaches an annotation to the generated class that will
 ;; constrain the job execution to only be one at a time. Other triggers wanting the job to run will misfire.
 
-(defn sync-and-analyze-database
+(def ^:private analyze-duration-threshold-for-refingerprinting
+  "If the `analyze-db!` step is shorter than this number of `minutes`, then we may refingerprint fields."
+  5)
+
+(defn- should-refingerprint-fields?
+  "Whether to refingerprint fields in the database. Looks at the runtime of the last analysis and if any fields were
+  fingerprinted. If no fields were fingerprinted and the run was shorter than the threshold, it will re-fingerprint
+  some fields."
+  [{:keys [start-time end-time steps] :as _analyze-results}]
+  (let [attempted (some->> steps
+                           (filter (fn [[step-name _results]] (= step-name "fingerprint-fields")))
+                           first
+                           second
+                           :fingerprints-attempted)]
+    (and (number? attempted)
+         (zero? attempted)
+         start-time
+         end-time
+         (< (.toMinutes (t/duration start-time end-time)) analyze-duration-threshold-for-refingerprinting))))
+
+(defn- sync-and-analyze-database!
   "The sync and analyze database job, as a function that can be used in a test"
   [job-context]
   (when-let [database-id (job-context->database-id job-context)]
@@ -49,12 +67,14 @@
       (sync-metadata/sync-db-metadata! database)
       ;; only run analysis if this is a "full sync" database
       (when (:is_full_sync database)
-        (analyze/analyze-db! database)))) )
+        (let [results (analyze/analyze-db! database)]
+          (when (and (:refingerprint database) (should-refingerprint-fields? results))
+            (analyze/refingerprint-db! database)))))))
 
 (jobs/defjob ^{org.quartz.DisallowConcurrentExecution true} SyncAndAnalyzeDatabase [job-context]
-  (sync-and-analyze-database job-context))
+  (sync-and-analyze-database! job-context))
 
-(defn update-field-values
+(defn- update-field-values!
   "The update field values job, as a function that can be used in a test"
   [job-context]
   (when-let [database-id (job-context->database-id job-context)]
@@ -68,7 +88,7 @@
         (log/info (trs "Skipping update, automatic Field value updates are disabled for Database {0}." database-id))))))
 
 (jobs/defjob ^{org.quartz.DisallowConcurrentExecution true} UpdateFieldValues [job-context]
-  (update-field-values job-context))
+  (update-field-values! job-context))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                         TASK INFO AND GETTER FUNCTIONS                                         |
@@ -206,12 +226,38 @@
   (task/add-job! sync-analyze-job)
   (task/add-job! field-values-job))
 
+(defn randomized-schedules
+  "Updated default schedules for the sync task when given the original default schedules.
+  The defaults used to be all at the same time leading to poor resource management. If the user has not indicated they
+  want to control the scheduling, returns appropriate randomized schedules for the sync tasks."
+  [{:keys [details cache_field_values_schedule metadata_sync_schedule] :as _database}]
+  (when-not (:let-user-control-scheduling details)
+    (let [random-defaults (sync.schedules/schedule-map->cron-strings (sync.schedules/default-schedule))
+          old-default-keys (cond-> []
+                             (contains? sync.schedules/default-cache-field-values-schedule-cron-strings cache_field_values_schedule)
+                             (conj :cache_field_values_schedule)
+
+                             (contains? sync.schedules/default-metadata-sync-schedule-cron-strings metadata_sync_schedule)
+                             (conj :metadata_sync_schedule))]
+      (not-empty (select-keys random-defaults old-default-keys)))))
+
+(defn maybe-update-db-schedules
+  "Update schedules when managed by metabase to spread the syncs out in time.
+  When not let-user-control-scheduling metabase is in control of the sync times. These used to all be scheduled at
+  every hour at 50 minutes or on the hour. This can cause a large load on the databaes or CPU and this attempts to
+  spread them out in time."
+  [database]
+  (if-let [randomized-schedules (randomized-schedules database)]
+    (u/prog1 (merge database randomized-schedules)
+      (db/update! Database (u/the-id database) randomized-schedules))
+    database))
+
 (defmethod task/init! ::SyncDatabases
   [_]
   (job-init)
   (doseq [database (db/select Database)]
     (try
       ;; TODO -- shouldn't all the triggers be scheduled already?
-      (schedule-tasks-for-db! database)
+      (schedule-tasks-for-db! (maybe-update-db-schedules database))
       (catch Throwable e
         (log/error e (trs "Failed to schedule tasks for Database {0}" (:id database)))))))

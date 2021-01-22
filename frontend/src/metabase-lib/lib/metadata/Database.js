@@ -35,7 +35,7 @@ export default class Database extends Base {
     return this.name;
   }
 
-  // SCEMAS
+  // SCHEMAS
 
   schema(schemaName: ?SchemaName) {
     return this.metadata.schema(generateSchemaId(this.id, schemaName));
@@ -77,6 +77,10 @@ export default class Database extends Base {
     } else {
       return set.has(feature);
     }
+  }
+
+  supportsPivots() {
+    return this.hasFeature("expressions") && this.hasFeature("left-join");
   }
 
   // QUESTIONS

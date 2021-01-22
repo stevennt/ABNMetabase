@@ -26,6 +26,8 @@ If you're writing a native MongoDB query, your query would look more like this, 
 {% raw %}[{ $match: { category: {{cat}} } }]{% endraw %}
 ```
 
+To learn more about SQL variables, check out [Create filter widgets for charts using SQL variables](https://www.metabase.com/blog/sql-template-variables/index.html).
+
 ### The Field Filter variable type
 
 Setting a variable to the "Field Filter" type allows you to map it to a field in any table in the current database, and lets you display a dropdown filter widget filled with the values of the field you connected it to. Field filter variables also allow you to connect your SQL question to a dashboard filter if you put it in a dashboard.
@@ -83,6 +85,8 @@ Filter widgets **can't** be displayed if the variable is mapped to a field marke
 - Latitude
 - Longitude
 - URL
+
+You can learn more in [Field Filters: create smart filter widgets for SQL questions](https://www.metabase.com/blog/field-filters/index.html)
 
 #### Setting a default value
 
@@ -157,33 +161,8 @@ WHERE True
   [[AND {% raw %}{{category}}{% endraw %}]]
 ```
 
-### Using an existing question as a sub-query
-
-You can use an existing question in a new query with the following variable syntax:
-
-```
-SELECT count(*)
-FROM {% raw %}{{#123}}{% endraw %}
-```
-
-This will return the number of records returned by the existing question with ID 123. A question's ID is the number at the end of the URL in your browser's location bar, after `/question/`, when viewing the question.
-
-Alternatively, you can select the target question in the sidebar, in the "Question #..." box that appears after typing `{% raw %}{{#}}{% endraw %}` in the query editor. The saved question you select has to be one that's based on the same database as the one you've currently selected in the native query editor.
-
-The same syntax can be used in Common Table Expressions (CTEs), with databases that support them:
-
-```
-WITH filtered_products AS {% raw %}{{#123}}{% endraw %}
-SELECT count(*)
-FROM filtered_products
-```
-
-The `{% raw %}{{#123}}{% endraw %}` tag is substituted for the SQL query of the referenced question, surrounded by parentheses.
-
-**Note:** Sub-queries are only supported in SQL databases.
-
 ---
 
-## Next: automated x-ray explorations
+## Next: Referencing saved questions in queries
 
-Learn about how to easily and quickly see automatic explorations of your data with Metabase's powerful [x-ray feature](14-x-rays.md).
+Learn how to [refer to a saved question in a SQL query](referencing-saved-questions-in-queries.md).
