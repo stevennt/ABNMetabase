@@ -2,31 +2,28 @@
   "Tests for /api/database endpoints."
   (:require [clojure.test :refer :all]
             [medley.core :as m]
-            [metabase
-             [driver :as driver]
-             [models :refer [Card Collection Database Field FieldValues Table]]
-             [test :as mt]
-             [util :as u]]
-            [metabase.api
-             [database :as database-api]
-             [table :as table-api]]
+            [metabase.api.database :as database-api]
+            [metabase.api.table :as table-api]
+            [metabase.driver :as driver]
             [metabase.driver.util :as driver.u]
             [metabase.mbql.schema :as mbql.s]
-            [metabase.models
-             [permissions :as perms]
-             [permissions-group :as perms-group]]
-            [metabase.sync
-             [analyze :as analyze]
-             [field-values :as field-values]
-             [sync-metadata :as sync-metadata]]
-            [metabase.test
-             [fixtures :as fixtures]
-             [util :as tu]]
+            [metabase.models :refer [Card Collection Database Field FieldValues Table]]
+            [metabase.models.database :as database :refer [protected-password]]
+            [metabase.models.permissions :as perms]
+            [metabase.models.permissions-group :as perms-group]
+            [metabase.sync.analyze :as analyze]
+            [metabase.sync.field-values :as field-values]
+            [metabase.sync.sync-metadata :as sync-metadata]
+            [metabase.test :as mt]
+            [metabase.test.fixtures :as fixtures]
+            [metabase.test.util :as tu]
+            [metabase.util :as u]
+            [metabase.util.cron :as cron-util]
             [metabase.util.schema :as su]
+            [ring.util.codec :as codec]
             [schema.core :as s]
-            [toucan
-             [db :as db]
-             [hydrate :as hydrate]]))
+            [toucan.db :as db]
+            [toucan.hydrate :as hydrate]))
 
 (use-fixtures :once (fixtures/initialize :db :plugins))
 
@@ -82,21 +79,25 @@
                                              :schedule_frame nil
                                              :schedule_hour  0
                                              :schedule_type  "daily"}
-                        :metadata_sync      {:schedule_day   nil
-                                             :schedule_frame nil
-                                             :schedule_hour  nil
-                                             :schedule_type  "hourly"}}))
+                        :metadata_sync      {:schedule_day    nil
+                                             :schedule_frame  nil
+                                             :schedule_hour   nil
+                                             :schedule_type   "hourly"
+                                             :schedule_minute 50}}))
 
 (deftest get-database-test
   (testing "GET /api/database/:id"
     (testing "DB details visibility"
       (testing "Regular users should not see DB details"
-        (is (= (add-schedules (dissoc (db-details) :details))
-               ((mt/user->client :rasta) :get 200 (format "database/%d" (mt/id))))))
+        (is (= (-> (db-details)
+                   (dissoc :details :schedules))
+               (-> ((mt/user->client :rasta) :get 200 (format "database/%d" (mt/id)))
+                   (dissoc :schedules)))))
 
       (testing "Superusers should see DB details"
-        (is (= (add-schedules (db-details))
-               ((mt/user->client :crowberto) :get 200 (format "database/%d" (mt/id)))))))
+        (is (= (db-details)
+               (-> ((mt/user->client :crowberto) :get 200 (format "database/%d" (mt/id)))
+                   (dissoc :schedules))))))
 
     (mt/with-temp* [Database [db {:name "My DB", :engine ::test-driver}]
                     Table    [t1 {:name "Table 1", :db_id (:id db)}]
@@ -150,6 +151,8 @@
     (testing "Check that we can create a Database"
       (is (schema= (merge
                     (m/map-vals s/eq (mt/object-defaults Database))
+                    {:metadata_sync_schedule #"0 \d{1,2} \* \* \* \? \*"
+                     :cache_field_values_schedule #"0 \d{1,2} \d{1,2} \* \* \? \*"}
                     {:created_at java.time.temporal.Temporal
                      :engine     (s/eq ::test-driver)
                      :id         su/IntGreaterThanZero
@@ -161,7 +164,24 @@
 
     (testing "can we set `is_full_sync` to `false` when we create the Database?"
       (is (= {:is_full_sync false}
-             (select-keys (create-db-via-api! {:is_full_sync false}) [:is_full_sync]))))))
+             (select-keys (create-db-via-api! {:is_full_sync false}) [:is_full_sync]))))
+    (testing "if `:let-user-control-scheduling` is false it will ignore any schedules provided"
+      (let [monthly-schedule {:schedule_type "monthly" :schedule_day "fri" :schedule_frame "last"}
+            {:keys [details metadata_sync_schedule cache_field_values_schedule]}
+            (create-db-via-api! {:schedules {:metadata_sync      monthly-schedule
+                                             :cache_field_values monthly-schedule}})]
+        (is (not (:let-user-control-scheduling details)))
+        (is (= "daily" (-> cache_field_values_schedule cron-util/cron-string->schedule-map :schedule_type)))
+        (is (= "hourly" (-> metadata_sync_schedule cron-util/cron-string->schedule-map :schedule_type)))))
+    (testing "if `:let-user-control-scheduling` is true it will accept the schedules"
+      (let [monthly-schedule {:schedule_type "monthly" :schedule_day "fri" :schedule_frame "last"}
+            {:keys [details metadata_sync_schedule cache_field_values_schedule]}
+            (create-db-via-api! {:details   {:let-user-control-scheduling true}
+                                 :schedules {:metadata_sync      monthly-schedule
+                                             :cache_field_values monthly-schedule}})]
+        (is (:let-user-control-scheduling details))
+        (is (= "monthly" (-> cache_field_values_schedule cron-util/cron-string->schedule-map :schedule_type)))
+        (is (= "monthly" (-> metadata_sync_schedule cron-util/cron-string->schedule-map :schedule_type)))))))
 
 (deftest delete-database-test
   (testing "DELETE /api/database/:id"
@@ -195,57 +215,58 @@
                       :features     (driver.u/features :h2)}
                      (into {} (db/select-one [Database :name :engine :details :is_full_sync], :id db-id)))))))))
 
-    (testing "should be able to set `auto_run_queries`"
-      (testing "when creating a Database"
-        (is (= {:auto_run_queries false}
-               (select-keys (create-db-via-api! {:auto_run_queries false}) [:auto_run_queries]))))
-      (testing "when updating a Database"
-        (mt/with-temp Database [{db-id :id} {:engine ::test-driver}]
-          (let [updates {:auto_run_queries false}]
-            ((mt/user->client :crowberto) :put 200 (format "database/%d" db-id) updates))
-          (is (= false
-                 (db/select-one-field :auto_run_queries Database, :id db-id))))))))
+    (mt/with-log-level :info
+                           (testing "should be able to set `auto_run_queries`"
+       (testing "when creating a Database"
+         (is (= {:auto_run_queries false}
+                (select-keys (create-db-via-api! {:auto_run_queries false}) [:auto_run_queries]))))
+       (testing "when updating a Database"
+         (mt/with-temp Database [{db-id :id} {:engine ::test-driver}]
+           (let [updates {:auto_run_queries false}]
+             ((mt/user->client :crowberto) :put 200 (format "database/%d" db-id) updates))
+           (is (= false
+                  (db/select-one-field :auto_run_queries Database, :id db-id)))))))))
 
 (deftest fetch-database-metadata-test
   (testing "GET /api/database/:id/metadata"
     (is (= (merge (dissoc (mt/object-defaults Database) :details)
                   (select-keys (mt/db) [:created_at :id :updated_at :timezone])
-                  {:engine   "h2"
-                   :name     "test-data"
-                   :features (map u/qualified-name (driver.u/features :h2))
-                   :tables   [(merge
-                               (mt/obj->json->obj (mt/object-defaults Table))
-                               (db/select-one [Table :created_at :updated_at] :id (mt/id :categories))
-                               {:schema       "PUBLIC"
-                                :name         "CATEGORIES"
-                                :display_name "Categories"
-                                :entity_type  "entity/GenericTable"
-                                :fields       [(merge
-                                                (field-details (Field (mt/id :categories :id)))
-                                                {:table_id          (mt/id :categories)
-                                                 :special_type      "type/PK"
-                                                 :name              "ID"
-                                                 :display_name      "ID"
-                                                 :database_type     "BIGINT"
-                                                 :base_type         "type/BigInteger"
-                                                 :visibility_type   "normal"
-                                                 :has_field_values  "none"
-                                                 :database_position 0})
-                                               (merge
-                                                (field-details (Field (mt/id :categories :name)))
-                                                {:table_id          (mt/id :categories)
-                                                 :special_type      "type/Name"
-                                                 :name              "NAME"
-                                                 :display_name      "Name"
-                                                 :database_type     "VARCHAR"
-                                                 :base_type         "type/Text"
-                                                 :visibility_type   "normal"
-                                                 :has_field_values  "list"
-                                                 :database_position 1})]
-                                :segments     []
-                                :metrics      []
-                                :id           (mt/id :categories)
-                                :db_id        (mt/id)})]})
+                  {:engine        "h2"
+                   :name          "test-data"
+                   :features      (map u/qualified-name (driver.u/features :h2))
+                   :tables        [(merge
+                                    (mt/obj->json->obj (mt/object-defaults Table))
+                                    (db/select-one [Table :created_at :updated_at] :id (mt/id :categories))
+                                    {:schema       "PUBLIC"
+                                     :name         "CATEGORIES"
+                                     :display_name "Categories"
+                                     :entity_type  "entity/GenericTable"
+                                     :fields       [(merge
+                                                     (field-details (Field (mt/id :categories :id)))
+                                                     {:table_id          (mt/id :categories)
+                                                      :special_type      "type/PK"
+                                                      :name              "ID"
+                                                      :display_name      "ID"
+                                                      :database_type     "BIGINT"
+                                                      :base_type         "type/BigInteger"
+                                                      :visibility_type   "normal"
+                                                      :has_field_values  "none"
+                                                      :database_position 0})
+                                                    (merge
+                                                     (field-details (Field (mt/id :categories :name)))
+                                                     {:table_id          (mt/id :categories)
+                                                      :special_type      "type/Name"
+                                                      :name              "NAME"
+                                                      :display_name      "Name"
+                                                      :database_type     "VARCHAR"
+                                                      :base_type         "type/Text"
+                                                      :visibility_type   "normal"
+                                                      :has_field_values  "list"
+                                                      :database_position 1})]
+                                     :segments     []
+                                     :metrics      []
+                                     :id           (mt/id :categories)
+                                     :db_id        (mt/id)})]})
            (let [resp (mt/derecordize ((mt/user->client :rasta) :get 200 (format "database/%d/metadata" (mt/id))))]
              (assoc resp :tables (filter #(= "CATEGORIES" (:name %)) (:tables resp))))))))
 
@@ -364,9 +385,22 @@
       (not-any?
        :is_saved_questions
        ((mt/user->client :lucky) :get 200 "database?saved=true")))
-    (testing "Ommit virtual DB if nested queries are disabled"
+    (testing "Omit virtual DB if nested queries are disabled"
       (tu/with-temporary-setting-values [enable-nested-queries false]
         (every? some? ((mt/user->client :lucky) :get 200 "database?saved=true"))))))
+
+(deftest fetch-databases-with-invalid-driver-test
+  (testing "GET /api/database"
+    (testing "\nEndpoint should still work even if there is a Database saved with a invalid driver"
+      (mt/with-temp Database [{db-id :id} {:engine "my-invalid-driver"}]
+        (testing (format "\nID of Database with invalid driver = %d" db-id)
+          (doseq [params [nil
+                          "?saved=true"
+                          "?include=tables"]]
+            (testing (format "\nparams = %s" (pr-str params))
+              (let [db-ids (set (map :id ((mt/user->client :lucky) :get 200 (str "database" params))))]
+                (testing "DB should still come back, even though driver is invalid :shrug:"
+                  (is (contains? db-ids db-id)))))))))))
 
 (def ^:private SavedQuestionsDB
   "Schema for the expected shape of info about the 'saved questions' virtual DB from API responses."
@@ -531,16 +565,18 @@
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
 (def ^:private schedule-map-for-last-friday-at-11pm
-  {:schedule_day   "fri"
-   :schedule_frame "last"
-   :schedule_hour  23
-   :schedule_type  "monthly"})
+  {:schedule_minute 0
+   :schedule_day    "fri"
+   :schedule_frame  "last"
+   :schedule_hour   23
+   :schedule_type   "monthly"})
 
 (def ^:private schedule-map-for-hourly
-  {:schedule_day   nil
-   :schedule_frame nil
-   :schedule_hour  nil
-   :schedule_type  "hourly"})
+  {:schedule_minute 0
+   :schedule_day    nil
+   :schedule_frame  nil
+   :schedule_hour   nil
+   :schedule_type   "hourly"})
 
 (deftest create-new-db-with-custom-schedules-test
   (testing "Can we create a NEW database and give it custom schedules?"
@@ -549,7 +585,7 @@
                       ((mt/user->client :crowberto) :post 200 "database"
                        {:name      db-name
                         :engine    (u/qualified-name ::test-driver)
-                        :details   {:db "my_db"}
+                        :details   {:db "my_db" :let-user-control-scheduling true}
                         :schedules {:cache_field_values schedule-map-for-last-friday-at-11pm
                                     :metadata_sync      schedule-map-for-hourly}}))]
              (is (= {:cache_field_values_schedule "0 0 23 ? * 6L *"
@@ -558,15 +594,36 @@
            (finally (db/delete! Database :name db-name))))))
 
 (deftest update-schedules-for-existing-db
-  (testing "Can we UPDATE the schedules for an existing database?"
-    (mt/with-temp Database [db {:engine "h2", :details (:details (mt/db))}]
-      ((mt/user->client :crowberto) :put 200 (format "database/%d" (u/get-id db))
-       (assoc db
-              :schedules {:cache_field_values schedule-map-for-last-friday-at-11pm
-                          :metadata_sync      schedule-map-for-hourly}))
-      (is (= {:cache_field_values_schedule "0 0 23 ? * 6L *"
-              :metadata_sync_schedule      "0 0 * * * ? *"}
-             (into {} (db/select-one [Database :cache_field_values_schedule :metadata_sync_schedule] :id (u/get-id db))))))))
+  (let [attempted {:cache_field_values schedule-map-for-last-friday-at-11pm
+                   :metadata_sync      schedule-map-for-hourly}
+        expected  {:cache_field_values_schedule "0 0 23 ? * 6L *"
+                   :metadata_sync_schedule      "0 0 * * * ? *"}]
+    (testing "Can we UPDATE the schedules for an existing database?"
+      (testing "We cannot if we don't mark `:let-user-control-scheduling`"
+        (mt/with-temp Database [db {:engine "h2", :details (:details (mt/db))}]
+          (mt/user-http-request :crowberto :put 200 (format "database/%d" (u/get-id db))
+                                (assoc db :schedules attempted))
+          (is (not= expected
+                    (into {} (db/select-one [Database :cache_field_values_schedule :metadata_sync_schedule] :id (u/the-id db)))))))
+      (testing "We can if we mark `:let-user-control-scheduling`"
+        (mt/with-temp Database [db {:engine "h2", :details (:details (mt/db))}]
+          (mt/user-http-request :crowberto :put 200 (format "database/%d" (u/the-id db))
+                                (-> db
+                                    (assoc :schedules attempted)
+                                    (assoc-in [:details :let-user-control-scheduling] true)))
+          (is (= expected
+                 (into {} (db/select-one [Database :cache_field_values_schedule :metadata_sync_schedule] :id (u/the-id db)))))))
+      (testing "if we update back to metabase managed schedules it randomizes for us"
+        (let [original-custom-schedules expected]
+          (mt/with-temp Database [db (merge {:engine "h2" :details (assoc (:details (mt/db))
+                                                                          :let-user-control-scheduling true)}
+                                            original-custom-schedules)]
+            (mt/user-http-request :crowberto :put 200 (format "database/%d" (u/the-id db))
+                                  (assoc-in db [:details :let-user-control-scheduling] false))
+            (let [schedules (into {} (db/select-one [Database :cache_field_values_schedule :metadata_sync_schedule] :id (u/the-id db)))]
+              (is (not= original-custom-schedules schedules))
+              (is (= "hourly" (-> schedules :metadata_sync_schedule cron-util/cron-string->schedule-map :schedule_type)))
+              (is (= "daily" (-> schedules :cache_field_values_schedule cron-util/cron-string->schedule-map :schedule_type))))))))))
 
 (deftest fetch-db-with-expanded-schedules
   (testing "If we FETCH a database will it have the correct 'expanded' schedules?"
@@ -683,7 +740,34 @@
           (testing "via the API endpoint"
             (is (= {:valid false}
                    ((mt/user->client :crowberto) :post 200 "database/validate"
-                    {:details {:engine :h2, :details {:db "ABC"}}})))))))))
+                    {:details {:engine :h2, :details {:db "ABC"}}})))))))
+
+    (let [call-count (atom 0)
+          ssl-values (atom [])]
+      (with-redefs [database-api/test-database-connection (fn [_ details]
+                                                            (swap! call-count inc)
+                                                            (swap! ssl-values conj (:ssl details))
+                                                            {:valid true})]
+          (testing "with SSL enabled, do not allow non-SSL connections"
+            (#'database-api/test-connection-details "presto" {:ssl true})
+            (is (= 1 @call-count))
+            (is (= [true] @ssl-values)))
+
+          (reset! call-count 0)
+          (reset! ssl-values [])
+
+          (testing "with SSL disabled, try twice (once with, once without SSL)"
+            (#'database-api/test-connection-details "presto" {:ssl false})
+            (is (= 2 @call-count))
+            (is (= [true false] @ssl-values)))
+
+          (reset! call-count 0)
+          (reset! ssl-values [])
+
+          (testing "with SSL unspecified, try twice (once with, once without SSL)"
+            (#'database-api/test-connection-details "presto" {})
+            (is (= 2 @call-count))
+            (is (= [true false] @ssl-values)))))))
 
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
@@ -875,3 +959,138 @@
       (testing "to fetch Tables with `nil` or empty schemas, use the blank string"
         (is (= ["t1" "t2"]
                (map :name ((mt/user->client :lucky) :get 200 (format "database/%d/schema/" db-id)))))))))
+
+(deftest slashes-in-identifiers-test
+  (testing "We should handle Databases with slashes in identifiers correctly (#12450)"
+    (mt/with-temp Database [{db-id :id} {:name "my/database"}]
+      (doseq [schema-name ["my/schema"
+                           "my//schema"
+                           "my\\schema"
+                           "my\\\\schema"
+                           "my\\//schema"
+                           "my_schema/"
+                           "my_schema\\"]]
+        (testing (format "\nschema name = %s" (pr-str schema-name))
+          (mt/with-temp Table [{table-id :id} {:db_id db-id, :schema schema-name, :name "my/table"}]
+            (testing "\nFetch schemas"
+              (testing "\nGET /api/database/:id/schemas/"
+                (is (= [schema-name]
+                       ((mt/user->client :rasta) :get 200 (format "database/%d/schemas" db-id))))))
+            (testing (str "\nFetch schema tables -- should work if you URL escape the schema name"
+                          "\nGET /api/database/:id/schema/:schema")
+              (let [url (format "database/%d/schema/%s" db-id (codec/url-encode schema-name))]
+                (testing (str "\nGET /api/" url)
+                  (is (schema= [{:schema (s/eq schema-name)
+                                 s/Keyword s/Any}]
+                               ((mt/user->client :rasta) :get 200 url))))))))))))
+
+(deftest upsert-sensitive-values-test
+  (testing "empty maps are okay"
+    (is (= {}
+           (database-api/upsert-sensitive-fields {} {}))))
+  (testing "no details updates are okay"
+    (is (= nil
+           (database-api/upsert-sensitive-fields nil nil))))
+  (testing "fields are replaced"
+    (is (= {:use-service-account           nil
+            :dataset-id                    "dacort"
+            :use-jvm-timezone              false
+            :service-account-json          "{\"foo\": \"bar\"}"
+            :password                      "foo"
+            :pass                          "bar"
+            :tunnel-pass                   "quux"
+            :tunnel-private-key            "foobar"
+            :tunnel-private-key-passphrase "fooquux"
+            :access-token                  "foobarfoo"
+            :refresh-token                 "foobarquux"}
+           (database-api/upsert-sensitive-fields {:description nil
+                                                  :name        "customer success BQ"
+                                                  :details     {:use-service-account           nil
+                                                                :dataset-id                    "dacort"
+                                                                :service-account-json          "{}"
+                                                                :use-jvm-timezone              false
+                                                                :password                      "password"
+                                                                :pass                          "pass"
+                                                                :tunnel-pass                   "tunnel-pass"
+                                                                :tunnel-private-key            "tunnel-private-key"
+                                                                :tunnel-private-key-passphrase "tunnel-private-key-passphrase"
+                                                                :access-token                  "access-token"
+                                                                :refresh-token                 "refresh-token"}
+                                                  :id          2}
+                                                 {:service-account-json          "{\"foo\": \"bar\"}"
+                                                  :password                      "foo"
+                                                  :pass                          "bar"
+                                                  :tunnel-pass                   "quux"
+                                                  :tunnel-private-key            "foobar"
+                                                  :tunnel-private-key-passphrase "fooquux"
+                                                  :access-token                  "foobarfoo"
+                                                  :refresh-token                 "foobarquux"}))))
+  (testing "no fields are replaced"
+    (is (= {:use-service-account           nil
+            :dataset-id                    "dacort"
+            :use-jvm-timezone              false
+            :service-account-json          "{}"
+            :password                      "password"
+            :pass                          "pass"
+            :tunnel-pass                   "tunnel-pass"
+            :tunnel-private-key            "tunnel-private-key"
+            :tunnel-private-key-passphrase "tunnel-private-key-passphrase"
+            :access-token                  "access-token"
+            :refresh-token                 "refresh-token"}
+           (database-api/upsert-sensitive-fields {:description nil
+                                                  :name        "customer success BQ"
+                                                  :details     {:use-service-account           nil
+                                                                :dataset-id                    "dacort"
+                                                                :use-jvm-timezone              false
+                                                                :service-account-json          "{}"
+                                                                :password                      "password"
+                                                                :pass                          "pass"
+                                                                :tunnel-pass                   "tunnel-pass"
+                                                                :tunnel-private-key            "tunnel-private-key"
+                                                                :tunnel-private-key-passphrase "tunnel-private-key-passphrase"
+                                                                :access-token                  "access-token"
+                                                                :refresh-token                 "refresh-token"}
+                                                  :id          2}
+                                                 {:service-account-json          protected-password
+                                                  :password                      protected-password
+                                                  :pass                          protected-password
+                                                  :tunnel-pass                   protected-password
+                                                  :tunnel-private-key            protected-password
+                                                  :tunnel-private-key-passphrase protected-password
+                                                  :access-token                  protected-password
+                                                  :refresh-token                 protected-password}))))
+
+  (testing "only one field is replaced"
+    (is (= {:use-service-account           nil
+            :dataset-id                    "dacort"
+            :use-jvm-timezone              false
+            :service-account-json          "{}"
+            :password                      "new-password"
+            :pass                          "pass"
+            :tunnel-pass                   "tunnel-pass"
+            :tunnel-private-key            "tunnel-private-key"
+            :tunnel-private-key-passphrase "tunnel-private-key-passphrase"
+            :access-token                  "access-token"
+            :refresh-token                 "refresh-token"}
+           (database-api/upsert-sensitive-fields {:description nil
+                                                  :name        "customer success BQ"
+                                                  :details     {:use-service-account           nil
+                                                                :dataset-id                    "dacort"
+                                                                :use-jvm-timezone              false
+                                                                :service-account-json          "{}"
+                                                                :password                      "password"
+                                                                :pass                          "pass"
+                                                                :tunnel-pass                   "tunnel-pass"
+                                                                :tunnel-private-key            "tunnel-private-key"
+                                                                :tunnel-private-key-passphrase "tunnel-private-key-passphrase"
+                                                                :access-token                  "access-token"
+                                                                :refresh-token                 "refresh-token"}
+                                                  :id          2}
+                                                 {:service-account-json          protected-password
+                                                  :password                      "new-password"
+                                                  :pass                          protected-password
+                                                  :tunnel-pass                   protected-password
+                                                  :tunnel-private-key            protected-password
+                                                  :tunnel-private-key-passphrase protected-password
+                                                  :access-token                  protected-password
+                                                  :refresh-token                 protected-password})))))

@@ -1,14 +1,16 @@
 import { signIn, restore, popover } from "__support__/cypress";
 
 describe("scenarios > dashboard > nested cards", () => {
-  before(restore);
-  beforeEach(signIn);
+  beforeEach(() => {
+    restore();
+    signIn();
+  });
 
   it("should show fields on nested cards", () => {
     createDashboardWithNestedCard(dashId => {
       cy.visit(`/dashboard/${dashId}`);
       cy.get(".Icon-pencil").click();
-      cy.get(".Icon-funnel_add").click();
+      cy.get(".Icon-filter").click();
       popover()
         .contains("Time")
         .click();
@@ -32,9 +34,7 @@ function createDashboardWithNestedCard(callback) {
       database: 1,
     },
     display: "table",
-    description: null,
     visualization_settings: {},
-    collection_id: null,
   }).then(({ body }) =>
     cy
       .request("POST", "/api/card", {

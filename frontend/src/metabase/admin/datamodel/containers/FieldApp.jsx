@@ -322,6 +322,7 @@ const FieldGeneralPane = ({
         description={t`When this field is used in a filter, what should people use to enter the value they want to filter on?`}
       />
       <Select
+        className="inline-block"
         value={field.has_field_values}
         onChange={({ target: { value } }) =>
           onUpdateFieldProperties({
@@ -368,7 +369,7 @@ const FieldSettingsPane = ({ field, onUpdateFieldSettings }) => (
       value={(field && field.settings) || {}}
       onChange={onUpdateFieldSettings}
       column={field}
-      blacklist={
+      denylist={
         new Set(
           ["column_title"].concat(isCurrency(field) ? ["number_style"] : []),
         )

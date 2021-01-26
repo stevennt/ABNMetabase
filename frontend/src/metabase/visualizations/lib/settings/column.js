@@ -48,7 +48,7 @@ type ColumnGetter = (
 ) => Column[];
 
 const DEFAULT_GET_COLUMNS: ColumnGetter = (series, vizSettings) =>
-  [].concat(...series.map(s => s.data.cols));
+  [].concat(...series.map(s => (s.data && s.data.cols) || []));
 
 type ColumnSettingDef = SettingDef & {
   getColumns?: ColumnGetter,
@@ -386,6 +386,7 @@ export const NUMBER_COLUMN_SETTINGS = {
         { name: "100 000,00", value: ", " },
         { name: "100.000,00", value: ",." },
         { name: "100000.00", value: "." },
+        { name: "100’000.00", value: ".’" },
       ],
     },
     default: ".,",

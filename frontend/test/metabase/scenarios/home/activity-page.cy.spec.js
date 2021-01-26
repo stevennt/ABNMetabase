@@ -8,8 +8,10 @@ import {
 //Replaces HomepageApp.e2e.spec.js
 
 describe("metabase > scenarios > home > activity-page", () => {
-  before(restore);
-  beforeEach(signInAsAdmin);
+  beforeEach(() => {
+    restore();
+    signInAsAdmin();
+  });
 
   it("should show test startup activity ", () => {
     cy.visit("/activity");
@@ -25,7 +27,7 @@ describe("metabase > scenarios > home > activity-page", () => {
     openProductsTable();
     cy.findByText("Rating").click();
     popover().within(() => {
-      cy.findByText("Filter").click();
+      cy.findByText("Filter by this column").click();
       cy.findByPlaceholderText("Enter a number").type("5");
       cy.findByText("Update filter").click();
     });

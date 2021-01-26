@@ -3,7 +3,7 @@
 import React from "react";
 
 import ExplicitSize from "metabase/components/ExplicitSize";
-import LegendHeader from "metabase/visualizations/components/LegendHeader";
+import TitleLegendHeader from "metabase/visualizations/components/TitleLegendHeader";
 import ChartTooltip from "metabase/visualizations/components/ChartTooltip";
 import ChartClickActions from "metabase/visualizations/components/ChartClickActions";
 import LoadingSpinner from "metabase/components/LoadingSpinner";
@@ -31,7 +31,7 @@ import {
 
 import NoResults from "assets/img/no_results.svg";
 
-import { assoc, setIn } from "icepick";
+import { assoc } from "icepick";
 import _ from "underscore";
 import cx from "classnames";
 
@@ -39,6 +39,7 @@ export const ERROR_MESSAGE_GENERIC = t`There was a problem displaying this chart
 export const ERROR_MESSAGE_PERMISSION = t`Sorry, you don't have permission to see this card.`;
 
 import Question from "metabase-lib/lib/Question";
+import Query from "metabase-lib/lib/queries/Query";
 import Mode from "metabase-lib/lib/Mode";
 import type {
   Card as CardObject,
@@ -88,6 +89,9 @@ type Props = {
   onChangeCardAndRun: OnChangeCardAndRun,
   onChangeLocation: (url: string) => void,
 
+  // for checking renderability
+  query: Query,
+
   mode?: Mode,
 
   // used for showing content in place of visualization, e.x. dashcard filter mapping
@@ -104,12 +108,14 @@ type Props = {
   gridUnit?: number,
 
   classNameWidgets?: string,
+
+  getExtraDataForClick?: Function,
 };
 
 type State = {
   series: ?Series,
   visualization: ?(React.Component<void, VisualizationSettings, void> & {
-    checkRenderable: (any, any) => void,
+    checkRenderable: (any, any, any) => void,
     noHeader: boolean,
   }),
   computedSettings: VisualizationSettings,
@@ -273,7 +279,11 @@ export default class Visualization extends React.PureComponent {
     if (!clicked) {
       return [];
     }
-    const { rawSeries, metadata } = this.props;
+    const {
+      rawSeries,
+      metadata,
+      getExtraDataForClick = () => ({}),
+    } = this.props;
     // TODO: push this logic into Question?
     const seriesIndex = clicked.seriesIndex || 0;
     const card = rawSeries[seriesIndex].card;
@@ -281,7 +291,13 @@ export default class Visualization extends React.PureComponent {
     const mode = this.props.mode
       ? question && new Mode(question, this.props.mode)
       : question && question.mode();
-    return mode ? mode.actionsForClick(clicked, {}) : [];
+
+    return mode
+      ? mode.actionsForClick(
+          { ...clicked, extraData: getExtraDataForClick(clicked) },
+          {},
+        )
+      : [];
   }
 
   visualizationIsClickable = (clicked: ClickObject) => {
@@ -404,7 +420,7 @@ export default class Visualization extends React.PureComponent {
       } else {
         try {
           if (visualization.checkRenderable) {
-            visualization.checkRenderable(series, settings);
+            visualization.checkRenderable(series, settings, this.props.query);
           }
         } catch (e) {
           error = e.message || t`Could not display this chart with this data.`;
@@ -490,7 +506,10 @@ export default class Visualization extends React.PureComponent {
     const CardVisualization = visualization;
 
     return (
-      <div className={cx(className, "flex flex-column")} style={style}>
+      <div
+        className={cx(className, "flex flex-column full-height")}
+        style={style}
+      >
         {(showTitle &&
           (settings["card.title"] || extra) &&
           (loading ||
@@ -499,21 +518,14 @@ export default class Visualization extends React.PureComponent {
             !(visualization && visualization.noHeader))) ||
         replacementContent ? (
           <div className="p1 flex-no-shrink">
-            <LegendHeader
+            <TitleLegendHeader
               classNameWidgets={classNameWidgets}
-              series={
-                settings["card.title"]
-                  ? // if we have a card title set, use it
-                    // $FlowFixMe
-                    setIn(series, [0, "card", "name"], settings["card.title"])
-                  : // otherwise use the original series
-                    series
-              }
+              series={series}
               actionButtons={extra}
               description={settings["card.description"]}
               settings={settings}
               onChangeCardAndRun={
-                this.props.onChangeCardAndRun
+                this.props.onChangeCardAndRun && !replacementContent
                   ? this.handleOnChangeCardAndRun
                   : null
               }

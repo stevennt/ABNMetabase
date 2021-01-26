@@ -1,32 +1,27 @@
 (ns metabase.api.dataset-test
   "Unit tests for /api/dataset endpoints."
-  (:require [cheshire
-             [core :as json]
-             [generate :as generate]]
-            [clojure
-             [string :as str]
-             [test :refer :all]]
+  (:require [cheshire.core :as json]
+            [cheshire.generate :as generate]
             [clojure.data.csv :as csv]
+            [clojure.string :as str]
+            [clojure.test :refer :all]
             [dk.ative.docjure.spreadsheet :as spreadsheet]
             [medley.core :as m]
-            [metabase
-             [http-client :as http-client]
-             [query-processor-test :as qp.test]
-             [test :as mt]
-             [util :as u]]
+            [metabase.api.pivots :as pivots]
+            [metabase.http-client :as http-client]
             [metabase.mbql.schema :as mbql.s]
-            [metabase.models
-             [card :refer [Card]]
-             [permissions :as perms]
-             [permissions-group :as group]
-             [query-execution :refer [QueryExecution]]]
+            [metabase.models.card :refer [Card]]
+            [metabase.models.permissions :as perms]
+            [metabase.models.permissions-group :as group]
+            [metabase.models.query-execution :refer [QueryExecution]]
+            [metabase.query-processor-test :as qp.test]
             [metabase.query-processor.middleware.constraints :as constraints]
-            [metabase.test
-             [fixtures :as fixtures]
-             [util :as tu]]
-            [metabase.test.data
-             [dataset-definitions :as defs]
-             [users :as test-users]]
+            [metabase.test :as mt]
+            [metabase.test.data.dataset-definitions :as defs]
+            [metabase.test.data.users :as test-users]
+            [metabase.test.fixtures :as fixtures]
+            [metabase.test.util :as tu]
+            [metabase.util :as u]
             [schema.core :as s]
             [toucan.db :as db])
   (:import com.fasterxml.jackson.core.JsonGenerator))
@@ -189,7 +184,7 @@
           ["3" "2014-09-15" "8" "56"]
           ["4" "2014-03-11" "5" "4"]
           ["5" "2013-05-05" "3" "49"]]
-         (let [result ((mt/user->client :rasta) :post 202 "dataset/csv" :query
+         (let [result ((mt/user->client :rasta) :post 200 "dataset/csv" :query
                        (json/generate-string (mt/mbql-query checkins)))]
            (take 5 (parse-and-sort-csv result))))))
 
@@ -201,7 +196,7 @@
             "Expires"             "Tue, 03 Jul 2001 06:00:00 GMT"
             "X-Accel-Buffering"   "no"}
            (-> (http-client/client-full-response (test-users/username->token :rasta)
-                                                 :post 202 "dataset/csv"
+                                                 :post 200 "dataset/csv"
                                                  :query (json/generate-string (mt/mbql-query checkins {:limit 1})))
                :headers
                (select-keys ["Cache-Control" "Content-Disposition" "Content-Type" "Expires" "X-Accel-Buffering"])
@@ -210,7 +205,7 @@
 
 (deftest check-an-empty-date-column
   (mt/dataset defs/test-data-with-null-date-checkins
-    (let [result ((mt/user->client :rasta) :post 202 "dataset/csv" :query
+    (let [result ((mt/user->client :rasta) :post 200 "dataset/csv" :query
                   (json/generate-string (mt/mbql-query checkins)))]
       (is (= [["1" "2014-04-07" "" "5" "12"]
               ["2" "2014-09-18" "" "1" "31"]
@@ -222,7 +217,7 @@
 (deftest sqlite-datetime-test
   (mt/test-driver :sqlite
     (testing "SQLite doesn't return proper date objects but strings, they just pass through the qp untouched"
-      (let [result ((mt/user->client :rasta) :post 202 "dataset/csv" :query
+      (let [result ((mt/user->client :rasta) :post 200 "dataset/csv" :query
                     (json/generate-string (mt/mbql-query checkins {:order-by [[:asc $id]], :limit 5})))]
         (is (= [["1" "2014-04-07" "5" "12"]
                 ["2" "2014-09-18" "1" "31"]
@@ -232,7 +227,7 @@
                (parse-and-sort-csv result)))))))
 
 (deftest datetime-fields-are-untouched-when-exported
-  (let [result ((mt/user->client :rasta) :post 202 "dataset/csv" :query
+  (let [result ((mt/user->client :rasta) :post 200 "dataset/csv" :query
                 (json/generate-string (mt/mbql-query users {:order-by [[:asc $id]], :limit 5})))]
     (is (= [["1" "Plato Yeshua"        "2014-04-01T08:30:00"]
             ["2" "Felipinho Asklepios" "2014-12-05T15:15:00"]
@@ -245,7 +240,7 @@
   (mt/with-temp Card [card {:dataset_query {:database (mt/id)
                                             :type     :native
                                             :native   {:query "SELECT * FROM USERS;"}}}]
-    (let [result ((mt/user->client :rasta) :post 202 "dataset/csv"
+    (let [result ((mt/user->client :rasta) :post 200 "dataset/csv"
                   :query (json/generate-string
                           {:database mbql.s/saved-questions-virtual-database-id
                            :type     :query
@@ -262,7 +257,7 @@
 ;; from one that had it -- see #9831)
 (deftest formatted-results-ignore-query-constraints
   (with-redefs [constraints/default-query-constraints {:max-results 10, :max-results-bare-rows 10}]
-    (let [result ((mt/user->client :rasta) :post 202 "dataset/csv"
+    (let [result ((mt/user->client :rasta) :post 200 "dataset/csv"
                   :query (json/generate-string
                           {:database   (mt/id)
                            :type       :query
@@ -347,3 +342,75 @@
                  (-> results
                      :data
                      (select-keys [:requested_timezone :results_timezone])))))))))
+
+(deftest pivot-dataset-test
+  (mt/test-drivers pivots/applicable-drivers
+    (mt/dataset sample-dataset
+      (testing "POST /api/dataset/pivot"
+        (testing "Run a pivot table"
+          (let [result (mt/user-http-request :rasta :post 202 "dataset/pivot" (pivots/pivot-query))
+                rows   (mt/rows result)]
+            (is (= 1144 (:row_count result)))
+            (is (= "completed" (:status result)))
+            (is (= 6 (count (get-in result [:data :cols]))))
+            (is (= 1144 (count rows)))
+
+            (is (= ["AK" "Affiliate" "Doohickey" 0 18 81] (first rows)))
+            (is (= ["WV" "Facebook" nil 4 45 292] (nth rows 1000)))
+            (is (= [nil nil nil 7 18760 69540] (last rows)))))
+
+        (testing "with an added expression"
+          (let [query (-> (pivots/pivot-query)
+                          (assoc-in [:query :fields] [[:expression "test-expr"]])
+                          (assoc-in [:query :expressions] {:test-expr [:ltrim "wheeee"]}))
+                result (mt/user-http-request :rasta :post 202 "dataset/pivot" query)
+                rows (mt/rows result)]
+            (is (= 1144 (:row_count result)))
+            (is (= 1144 (count rows)))
+
+            (let [cols (get-in result [:data :cols])]
+              (is (= 7 (count cols)))
+              (is (= {:base_type "type/Text"
+                      :special_type nil
+                      :name "test-expr"
+                      :display_name "test-expr"
+                      :expression_name "test-expr"
+                      :field_ref ["expression" "test-expr"]
+                      :source "breakout"}
+                     (nth cols 3))))
+
+            (is (= [nil nil nil "wheeee" 7 18760 69540] (last rows)))))))))
+
+(deftest pivot-filter-dataset-test
+  (mt/test-drivers pivots/applicable-drivers
+    (mt/dataset sample-dataset
+      (testing "POST /api/dataset/pivot"
+        (testing "Run a pivot table"
+          (let [result (mt/user-http-request :rasta :post 202 "dataset/pivot" (pivots/filters-query))
+                rows   (mt/rows result)]
+            (is (= 140 (:row_count result)))
+            (is (= "completed" (:status result)))
+            (is (= 4 (count (get-in result [:data :cols]))))
+            (is (= 140 (count rows)))
+
+            (is (= ["AK" "Google" 0 119] (first rows)))
+            (is (= ["AK" "Organic" 0 89] (second rows)))
+            (is (= ["WA" nil 2 148] (nth rows 135)))
+            (is (= [nil nil 3 7562] (last rows)))))))))
+
+(deftest pivot-parameter-dataset-test
+  (mt/test-drivers pivots/applicable-drivers
+    (mt/dataset sample-dataset
+      (testing "POST /api/dataset/pivot"
+        (testing "Run a pivot table"
+          (let [result (mt/user-http-request :rasta :post 202 "dataset/pivot" (pivots/parameters-query))
+                rows   (mt/rows result)]
+            (is (= 137 (:row_count result)))
+            (is (= "completed" (:status result)))
+            (is (= 4 (count (get-in result [:data :cols]))))
+            (is (= 137 (count rows)))
+
+            (is (= ["AK" "Google" 0 27] (first rows)))
+            (is (= ["AK" "Organic" 0 25] (second rows)))
+            (is (= ["VA" nil 2 29] (nth rows 130)))
+            (is (= [nil nil 3 2009] (last rows)))))))))
